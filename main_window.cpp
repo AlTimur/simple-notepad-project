@@ -2,11 +2,14 @@
 
 #include "notepad_exception.h"
 #include "spell_checker_highlighter.h"
+#include "symbol_insert_dialog.h"
+#include "text_statistics_dialog.h"
 #include "ui_find_replace_dialog.h"
 #include "ui_word_frequency_dialog.h"
 
 #include <QAction>
 #include <QApplication>
+#include <QColor>
 #include <QColorDialog>
 #include <QFile>
 #include <QFileDialog>
@@ -19,6 +22,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSplitter>
 #include <QStatusBar>
 #include <QTableWidgetItem>
 #include <QTextCharFormat>
@@ -35,10 +39,23 @@
 main_window::main_window()
 {
     setWindowTitle("Notepad");
-    resize(800, 600);
+    resize(900, 600);
 
-    editor = new QTextEdit(this);
-    setCentralWidget(editor);
+    splitter_ = new QSplitter(Qt::Horizontal, this);
+
+    editor = new QTextEdit(splitter_);
+    splitter_->addWidget(editor);
+
+    preview_ = new QTextEdit(splitter_);
+    preview_->setReadOnly(true);
+    preview_->setPlaceholderText("Markdown preview will appear here...");
+    preview_->hide();
+
+    splitter_->addWidget(preview_);
+    splitter_->setStretchFactor(0, 1);
+    splitter_->setStretchFactor(1, 1);
+
+    setCentralWidget(splitter_);
 
     transforms.push_back(std::make_unique<uppercase_transform>());
     transforms.push_back(std::make_unique<lowercase_transform>());
@@ -61,7 +78,11 @@ main_window::main_window()
     connect(editor, &QWidget::customContextMenuRequested,
         this, &main_window::show_context_menu);
 
-    connect(editor, &QTextEdit::textChanged, this, [this] { update_status_bar(); });
+    connect(editor, &QTextEdit::textChanged, this, [this] {
+        update_status_bar();
+        if (preview_visible_)
+            update_markdown_preview();
+    });
     connect(editor, &QTextEdit::cursorPositionChanged, this, [this] { update_status_bar(); });
     update_status_bar();
 }
@@ -84,6 +105,10 @@ void main_window::setup_file_menu()
     auto* action_open = file_menu->addAction("Open...");
     action_open->setShortcut(QKeySequence::Open);
     connect(action_open, &QAction::triggered, this, [this] { open_file(); });
+
+    auto* action_readme = file_menu->addAction("Open Readme...");
+    action_readme->setShortcut(QKeySequence("Ctrl+Shift+R"));
+    connect(action_readme, &QAction::triggered, this, [this] { open_readme(); });
 
     auto* action_save = file_menu->addAction("Save");
     action_save->setShortcut(QKeySequence::Save);
@@ -129,6 +154,12 @@ void main_window::setup_edit_menu()
     auto* action_select_all = edit_menu->addAction("Select All");
     action_select_all->setShortcut(QKeySequence::SelectAll);
     connect(action_select_all, &QAction::triggered, editor, &QTextEdit::selectAll);
+
+    edit_menu->addSeparator();
+
+    auto* action_symbol = edit_menu->addAction("Insert Symbol...");
+    action_symbol->setShortcut(QKeySequence("Ctrl+Shift+S"));
+    connect(action_symbol, &QAction::triggered, this, [this] { show_symbol_insert(); });
 }
 
 void main_window::setup_format_menu()
@@ -162,6 +193,32 @@ void main_window::setup_format_menu()
         if (color.isValid())
             editor->setTextColor(color);
     });
+
+    format_menu->addSeparator();
+
+    auto* highlight_menu = format_menu->addMenu("Highlight");
+
+    const auto add_color = [&](const QString& name, const QColor& color) {
+        auto* act = highlight_menu->addAction(name);
+        connect(act, &QAction::triggered, this, [this, color] { apply_highlight(color); });
+    };
+    add_color("Yellow", Qt::yellow);
+    add_color("Green", QColor(144, 238, 144));
+    add_color("Cyan", Qt::cyan);
+    add_color("Pink", QColor(255, 182, 193));
+    add_color("Orange", QColor(255, 165, 0));
+    highlight_menu->addSeparator();
+    auto* act_pick = highlight_menu->addAction("Choose Color...");
+    connect(act_pick, &QAction::triggered, this, [this] {
+        const QColor color = QColorDialog::getColor(highlight_color_, this, "Highlight Color");
+        if (color.isValid()) {
+            highlight_color_ = color;
+            apply_highlight(color);
+        }
+    });
+    highlight_menu->addSeparator();
+    auto* act_clear = highlight_menu->addAction("Clear Highlight");
+    connect(act_clear, &QAction::triggered, this, [this] { clear_highlight(); });
 
     format_menu->addSeparator();
 
@@ -207,6 +264,15 @@ void main_window::setup_format_toolbar()
         editor->mergeCurrentCharFormat(fmt);
     });
 
+    toolbar->addSeparator();
+
+    auto* action_highlight = toolbar->addAction("H");
+    action_highlight->setToolTip("Highlight selected text (Format > Highlight to pick color)");
+    action_highlight->setFont(QFont("Arial", 10, QFont::Bold));
+    connect(action_highlight, &QAction::triggered, this, [this] {
+        apply_highlight(highlight_color_);
+    });
+
     connect(editor, &QTextEdit::currentCharFormatChanged,
         this, [action_bold, action_italic, action_underline](const QTextCharFormat& fmt) {
             action_bold->setChecked(fmt.fontWeight() == QFont::Bold);
@@ -233,6 +299,11 @@ void main_window::setup_tools_menu()
     const auto* action_word_freq = tools_menu->addAction("Word Frequency...");
     connect(action_word_freq, &QAction::triggered, this, [this] { show_word_frequency(); });
 
+    const auto* action_stats = tools_menu->addAction("Text Statistics...");
+    connect(action_stats, &QAction::triggered, this, [this] { show_text_statistics(); });
+
+    tools_menu->addSeparator();
+
     const auto* action_spell = tools_menu->addAction("Check Spelling...");
     connect(action_spell, &QAction::triggered, this, [this] {
         if (highlighter_)
@@ -242,7 +313,6 @@ void main_window::setup_tools_menu()
 
 void main_window::setup_view_menu()
 {
-
     auto* view_menu = menuBar()->addMenu("View");
 
     auto* action_zoom_in = view_menu->addAction("Zoom In");
@@ -256,6 +326,14 @@ void main_window::setup_view_menu()
     auto* action_zoom_reset = view_menu->addAction("Reset Zoom");
     action_zoom_reset->setShortcut(QKeySequence("Ctrl+0"));
     connect(action_zoom_reset, &QAction::triggered, this, [this] { zoom_reset(); });
+
+    view_menu->addSeparator();
+
+    auto* action_preview = view_menu->addAction("Markdown Preview");
+    action_preview->setShortcut(QKeySequence("Ctrl+Shift+M"));
+    action_preview->setCheckable(true);
+    action_preview->setChecked(false);
+    connect(action_preview, &QAction::triggered, this, [this] { toggle_markdown_preview(); });
 }
 
 void main_window::open_file()
@@ -279,6 +357,36 @@ void main_window::open_file()
         editor->setPlainText(contents);
         current_file = path;
         update_title();
+    } catch (const notepad_exception& ex) {
+        QMessageBox::critical(this, "Error", ex.what());
+    }
+}
+
+void main_window::open_readme()
+{
+    const QString path = "Readme.md";
+
+    try {
+        QFile file(path);
+        if (!file.exists())
+            throw file_not_found_exception(path.toStdString());
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+            throw file_read_exception(path.toStdString());
+
+        QTextStream in(&file);
+        const auto contents = in.readAll();
+        if (in.status() != QTextStream::Ok)
+            throw file_read_exception(path.toStdString());
+
+        editor->setPlainText(contents);
+        current_file = path;
+        update_title();
+
+        if (!preview_visible_) {
+            preview_visible_ = true;
+            preview_->show();
+            update_markdown_preview();
+        }
     } catch (const notepad_exception& ex) {
         QMessageBox::critical(this, "Error", ex.what());
     }
@@ -484,6 +592,66 @@ void main_window::show_word_frequency()
     ui.frequency_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
 
     dialog->exec();
+}
+
+void main_window::show_text_statistics()
+{
+    auto* dialog = new text_statistics_dialog(editor->toPlainText(), this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->exec();
+}
+
+void main_window::show_symbol_insert()
+{
+    auto* dialog = new symbol_insert_dialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+
+    connect(dialog, &symbol_insert_dialog::symbol_selected, this, [this](const QString& sym) {
+        editor->textCursor().insertText(sym);
+    });
+
+    dialog->show();
+}
+
+void main_window::apply_highlight(const QColor& color)
+{
+    auto cursor = editor->textCursor();
+    if (!cursor.hasSelection())
+        return;
+
+    QTextCharFormat fmt;
+    fmt.setBackground(color);
+    cursor.mergeCharFormat(fmt);
+    editor->setTextCursor(cursor);
+}
+
+void main_window::clear_highlight()
+{
+    auto cursor = editor->textCursor();
+    if (!cursor.hasSelection())
+        cursor.select(QTextCursor::Document);
+
+    QTextCharFormat fmt;
+    fmt.setBackground(Qt::transparent);
+    cursor.mergeCharFormat(fmt);
+    editor->setTextCursor(cursor);
+}
+
+void main_window::toggle_markdown_preview()
+{
+    preview_visible_ = !preview_visible_;
+
+    if (preview_visible_) {
+        preview_->show();
+        update_markdown_preview();
+    } else {
+        preview_->hide();
+    }
+}
+
+void main_window::update_markdown_preview()
+{
+    preview_->setMarkdown(editor->toPlainText());
 }
 
 void main_window::show_context_menu(const QPoint& pos)
